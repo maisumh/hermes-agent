@@ -267,23 +267,46 @@ class SlackAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a message to a Slack channel or DM."""
+        """Send a message to a Slack channel or DM.
+
+        When the content contains rich markdown structure (headings, tables),
+        it is rendered using Slack Block Kit for a richer visual experience.
+        Plain text goes through the existing mrkdwn conversion path.
+        """
         if not self._app:
             return SendResult(success=False, error="Not connected")
 
         try:
-            # Convert standard markdown → Slack mrkdwn
-            formatted = self.format_message(content)
-
-            # Split long messages, preserving code block boundaries
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
-
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
+            broadcast = self.config.extra.get("reply_broadcast", False)
             last_result = None
 
-            # reply_broadcast: also post thread replies to the main channel.
-            # Controlled via platform config: gateway.slack.reply_broadcast
-            broadcast = self.config.extra.get("reply_broadcast", False)
+            # --- Rich Block Kit path ---
+            if self._has_rich_structure(content):
+                blocks, attachments, fallback = self._markdown_to_blocks(content)
+
+                if blocks or attachments:
+                    kwargs: Dict[str, Any] = {
+                        "channel": chat_id,
+                        "text": fallback,  # notification / accessibility fallback
+                    }
+                    if blocks:
+                        kwargs["blocks"] = blocks
+                    if attachments:
+                        kwargs["attachments"] = attachments  # SDK serialises this list internally
+                    if thread_ts:
+                        kwargs["thread_ts"] = thread_ts
+                        if broadcast:
+                            kwargs["reply_broadcast"] = True
+
+                    last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+                    sent_ts = last_result.get("ts") if last_result else None
+                    self._track_sent_ts(sent_ts, thread_ts)
+                    return SendResult(success=True, message_id=sent_ts, raw_response=last_result)
+
+            # --- Plain mrkdwn path (unchanged) ---
+            formatted = self.format_message(content)
+            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
             for i, chunk in enumerate(chunks):
                 kwargs = {
@@ -299,28 +322,25 @@ class SlackAdapter(BasePlatformAdapter):
 
                 last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
 
-            # Track the sent message ts so we can auto-respond to thread
-            # replies without requiring @mention.
             sent_ts = last_result.get("ts") if last_result else None
-            if sent_ts:
-                self._bot_message_ts.add(sent_ts)
-                # Also register the thread root so replies-to-my-replies work
-                if thread_ts:
-                    self._bot_message_ts.add(thread_ts)
-                if len(self._bot_message_ts) > self._BOT_TS_MAX:
-                    excess = len(self._bot_message_ts) - self._BOT_TS_MAX // 2
-                    for old_ts in list(self._bot_message_ts)[:excess]:
-                        self._bot_message_ts.discard(old_ts)
-
-            return SendResult(
-                success=True,
-                message_id=sent_ts,
-                raw_response=last_result,
-            )
+            self._track_sent_ts(sent_ts, thread_ts)
+            return SendResult(success=True, message_id=sent_ts, raw_response=last_result)
 
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[Slack] Send error: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e))
+
+    def _track_sent_ts(self, sent_ts: Optional[str], thread_ts: Optional[str]) -> None:
+        """Register a sent message timestamp so the bot auto-responds to its own threads."""
+        if not sent_ts:
+            return
+        self._bot_message_ts.add(sent_ts)
+        if thread_ts:
+            self._bot_message_ts.add(thread_ts)
+        if len(self._bot_message_ts) > self._BOT_TS_MAX:
+            excess = len(self._bot_message_ts) - self._BOT_TS_MAX // 2
+            for old_ts in list(self._bot_message_ts)[:excess]:
+                self._bot_message_ts.discard(old_ts)
 
     async def edit_message(
         self,
@@ -352,12 +372,7 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Show a typing/status indicator using assistant.threads.setStatus.
-
-        Displays "is thinking..." next to the bot name in a thread.
-        Requires the assistant:write or chat:write scope.
-        Auto-clears when the bot sends a reply to the thread.
-        """
+        """Show a typing/status indicator using assistant.threads.setStatus."""
         if not self._app:
             return
 
@@ -366,7 +381,7 @@ class SlackAdapter(BasePlatformAdapter):
             thread_ts = metadata.get("thread_id") or metadata.get("thread_ts")
 
         if not thread_ts:
-            return  # Can only set status in a thread context
+            return
 
         self._active_status_threads[chat_id] = thread_ts
         try:
@@ -376,8 +391,6 @@ class SlackAdapter(BasePlatformAdapter):
                 status="is thinking...",
             )
         except Exception as e:
-            # Silently ignore — may lack assistant:write scope or not be
-            # in an assistant-enabled context. Falls back to reactions.
             logger.debug("[Slack] assistant.threads.setStatus failed: %s", e)
 
     async def stop_typing(self, chat_id: str) -> None:
@@ -397,17 +410,10 @@ class SlackAdapter(BasePlatformAdapter):
             logger.debug("[Slack] assistant.threads.setStatus clear failed: %s", e)
 
     def _dm_top_level_threads_as_sessions(self) -> bool:
-        """Whether top-level Slack DMs get per-message session threads.
-
-        Defaults to ``True`` so each visible DM reply thread is isolated as its
-        own Hermes session — matching the per-thread behavior channels already
-        have.  Set ``platforms.slack.extra.dm_top_level_threads_as_sessions``
-        to ``false`` in config.yaml to revert to the legacy behavior where all
-        top-level DMs share one continuous session.
-        """
+        """Whether top-level Slack DMs get per-message session threads."""
         raw = self.config.extra.get("dm_top_level_threads_as_sessions")
         if raw is None:
-            return True  # default: each DM thread is its own session
+            return True
         return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
     def _resolve_thread_ts(
@@ -415,18 +421,7 @@ class SlackAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
-        """Resolve the correct thread_ts for a Slack API call.
-
-        Prefers metadata thread_id (the thread parent's ts, set by the
-        gateway) over reply_to (which may be a child message's ts).
-
-        When ``reply_in_thread`` is ``false`` in the platform extra config,
-        top-level channel messages receive direct channel replies instead of
-        thread replies.  Messages that originate inside an existing thread are
-        always replied to in-thread to preserve conversation context.
-        """
-        # When reply_in_thread is disabled (default: True for backward compat),
-        # only thread messages that are already part of an existing thread.
+        """Resolve the correct thread_ts for a Slack API call."""
         if not self.config.extra.get("reply_in_thread", True):
             existing_thread = (metadata or {}).get("thread_id") or (metadata or {}).get("thread_ts")
             return existing_thread or None
@@ -462,15 +457,178 @@ class SlackAdapter(BasePlatformAdapter):
         )
         return SendResult(success=True, raw_response=result)
 
+    # ----- Block Kit rich formatting -----
+
+    # Max chars per mrkdwn section block (Slack limit: 3000)
+    _SECTION_MAX = 2900
+
+    @staticmethod
+    def _has_rich_structure(content: str) -> bool:
+        """Return True if content has headers or markdown tables worth Block Kit-ifying."""
+        if re.search(r'^#{1,6}\s+\S', content, re.MULTILINE):
+            return True
+        if re.search(r'^\|.+\|', content, re.MULTILINE):
+            return True
+        return False
+
+    def _markdown_to_blocks(self, content: str):
+        """Convert structured markdown to a (blocks, attachments, fallback) tuple.
+
+        Handles:
+        - H1 (# title) → Slack ``header`` block (plain_text, max 150 chars)
+        - H2–H6 (## ...) → bold mrkdwn section acting as sub-heading
+        - Markdown tables → Slack ``table`` block inside attachments
+        - Code fences → mrkdwn section preserving the fence
+        - All other paragraphs/bullets → mrkdwn section with inline formatting
+
+        Returns:
+            blocks (list[dict])        — goes in the ``blocks`` field
+            attachments (list[dict])   — goes in the ``attachments`` field
+            fallback (str)             — plain-text fallback for notifications
+        """
+        blocks: list = []
+        attachments: list = []
+        fallback_lines: list = []
+
+        def _flush_section(buf: list) -> None:
+            text = "\n".join(buf).strip()
+            if not text:
+                return
+            while text:
+                chunk = text[:self._SECTION_MAX]
+                text = text[self._SECTION_MAX:]
+                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
+                fallback_lines.append(chunk)
+
+        def _parse_table(table_lines: list) -> dict | None:
+            rows_raw = [line for line in table_lines if re.match(r'^\|', line.strip())]
+            data_rows = [r for r in rows_raw if not re.match(r'^\|\s*[-:]+[\s|:-]*$', r.strip())]
+            if not data_rows:
+                return None
+
+            parsed: list[list[str]] = []
+            for row in data_rows:
+                cells = [c.strip() for c in row.strip().strip('|').split('|')]
+                parsed.append(cells)
+
+            if not parsed:
+                return None
+
+            col_count = max(len(r) for r in parsed)
+            col_count = min(col_count, 10)
+            col_count = max(col_count, 1)
+
+            slack_rows: list[list[dict]] = []
+            for row in parsed[:100]:
+                padded = row[:col_count] + [""] * (col_count - len(row))
+                slack_rows.append([{"type": "raw_text", "text": cell} for cell in padded])
+
+            return {
+                "type": "table",
+                "column_settings": [{"is_wrapped": True} for _ in range(col_count)],
+                "rows": slack_rows,
+            }
+
+        lines = content.split("\n")
+        buf: list[str] = []
+        table_buf: list[str] = []
+        in_code_fence = False
+        code_fence_buf: list[str] = []
+
+        def _flush_table() -> None:
+            nonlocal table_buf
+            if not table_buf:
+                return
+            table_block = _parse_table(table_buf)
+            if table_block:
+                attachments.append({"blocks": [table_block]})
+                fallback_lines.append("\n".join(table_buf))
+            else:
+                _flush_section(table_buf)
+            table_buf = []
+
+        def _is_table_row(line: str) -> bool:
+            return bool(re.match(r'^\s*\|', line))
+
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+
+            fence_match = re.match(r'^(```|~~~)(\w*)$', line.strip())
+            if fence_match and not in_code_fence:
+                _flush_table()
+                _flush_section(buf)
+                buf = []
+                in_code_fence = True
+                code_fence_buf = [line]
+                i += 1
+                continue
+            if in_code_fence:
+                code_fence_buf.append(line)
+                if re.match(r'^(```|~~~)\s*$', line.strip()):
+                    in_code_fence = False
+                    fence_text = "\n".join(code_fence_buf)
+                    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": fence_text}})
+                    fallback_lines.append(fence_text)
+                    code_fence_buf = []
+                i += 1
+                continue
+
+            if _is_table_row(line):
+                _flush_section(buf)
+                buf = []
+                table_buf.append(line)
+                i += 1
+                continue
+            elif table_buf:
+                _flush_table()
+
+            h1_match = re.match(r'^#\s+(.+)$', line)
+            if h1_match:
+                _flush_section(buf)
+                buf = []
+                title = re.sub(r'\*\*(.+?)\*\*', r'\1', h1_match.group(1)).strip()[:150]
+                blocks.append({"type": "header", "text": {"type": "plain_text", "text": title, "emoji": True}})
+                blocks.append({"type": "divider"})
+                fallback_lines.append(f"=== {title} ===")
+                i += 1
+                continue
+
+            hN_match = re.match(r'^#{2,6}\s+(.+)$', line)
+            if hN_match:
+                _flush_section(buf)
+                buf = []
+                inner = re.sub(r'\*\*(.+?)\*\*', r'\1', hN_match.group(1)).strip()
+                mrkdwn_heading = f"*{self.format_message(inner)}*"
+                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": mrkdwn_heading}})
+                fallback_lines.append(f"** {inner} **")
+                i += 1
+                continue
+
+            if line.strip() == "":
+                if buf:
+                    _flush_section(buf)
+                    buf = []
+                i += 1
+                continue
+
+            buf.append(self.format_message(line))
+            i += 1
+
+        if in_code_fence and code_fence_buf:
+            fence_text = "\n".join(code_fence_buf)
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": fence_text}})
+            fallback_lines.append(fence_text)
+        _flush_table()
+        _flush_section(buf)
+
+        fallback = "\n".join(fallback_lines)[:3000] or content[:3000]
+        return blocks, attachments, fallback
+
     # ----- Markdown → mrkdwn conversion -----
 
     def format_message(self, content: str) -> str:
-        """Convert standard markdown to Slack mrkdwn format.
-
-        Protected regions (code blocks, inline code) are extracted first so
-        their contents are never modified.  Standard markdown constructs
-        (headers, bold, italic, links) are translated to mrkdwn syntax.
-        """
+        """Convert standard markdown to Slack mrkdwn format."""
         if not content:
             return content
 
@@ -478,7 +636,6 @@ class SlackAdapter(BasePlatformAdapter):
         counter = [0]
 
         def _ph(value: str) -> str:
-            """Stash value behind a placeholder that survives later passes."""
             key = f"\x00SL{counter[0]}\x00"
             counter[0] += 1
             placeholders[key] = value
@@ -486,17 +643,14 @@ class SlackAdapter(BasePlatformAdapter):
 
         text = content
 
-        # 1) Protect fenced code blocks (``` ... ```)
         text = re.sub(
             r'(```(?:[^\n]*\n)?[\s\S]*?```)',
             lambda m: _ph(m.group(0)),
             text,
         )
 
-        # 2) Protect inline code (`...`)
         text = re.sub(r'(`[^`]+`)', lambda m: _ph(m.group(0)), text)
 
-        # 3) Convert markdown links [text](url) → <url|text>
         def _convert_markdown_link(m):
             label = m.group(1)
             url = m.group(2).strip()
@@ -510,26 +664,19 @@ class SlackAdapter(BasePlatformAdapter):
             text,
         )
 
-        # 4) Protect existing Slack entities/manual links so escaping and later
-        #    formatting passes don't break them.
         text = re.sub(
             r'(<(?:[@#!]|(?:https?|mailto|tel):)[^>\n]+>)',
             lambda m: _ph(m.group(1)),
             text,
         )
 
-        # 5) Protect blockquote markers before escaping
         text = re.sub(r'^(>+\s)', lambda m: _ph(m.group(0)), text, flags=re.MULTILINE)
 
-        # 6) Escape Slack control characters in remaining plain text.
-        # Unescape first so already-escaped input doesn't get double-escaped.
         text = text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
         text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
-        # 7) Convert headers (## Title) → *Title* (bold)
         def _convert_header(m):
             inner = m.group(1).strip()
-            # Strip redundant bold markers inside a header
             inner = re.sub(r'\*\*(.+?)\*\*', r'\1', inner)
             return _ph(f'*{inner}*')
 
@@ -537,38 +684,30 @@ class SlackAdapter(BasePlatformAdapter):
             r'^#{1,6}\s+(.+)$', _convert_header, text, flags=re.MULTILINE
         )
 
-        # 8) Convert bold+italic: ***text*** → *_text_* (Slack bold wrapping italic)
         text = re.sub(
             r'\*\*\*(.+?)\*\*\*',
             lambda m: _ph(f'*_{m.group(1)}_*'),
             text,
         )
 
-        # 9) Convert bold: **text** → *text* (Slack bold)
         text = re.sub(
             r'\*\*(.+?)\*\*',
             lambda m: _ph(f'*{m.group(1)}*'),
             text,
         )
 
-        # 10) Convert italic: _text_ stays as _text_ (already Slack italic)
-        #     Single *text* → _text_ (Slack italic)
         text = re.sub(
             r'(?<!\*)\*([^*\n]+)\*(?!\*)',
             lambda m: _ph(f'_{m.group(1)}_'),
             text,
         )
 
-        # 11) Convert strikethrough: ~~text~~ → ~text~
         text = re.sub(
             r'~~(.+?)~~',
             lambda m: _ph(f'~{m.group(1)}~'),
             text,
         )
 
-        # 12) Blockquotes: > prefix is already protected by step 5 above.
-
-        # 13) Restore placeholders in reverse order
         for key in reversed(placeholders):
             text = text.replace(key, placeholders[key])
 
@@ -579,7 +718,6 @@ class SlackAdapter(BasePlatformAdapter):
     async def _add_reaction(
         self, channel: str, timestamp: str, emoji: str
     ) -> bool:
-        """Add an emoji reaction to a message. Returns True on success."""
         if not self._app:
             return False
         try:
@@ -588,14 +726,12 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return True
         except Exception as e:
-            # Don't log as error — may fail if already reacted or missing scope
             logger.debug("[Slack] reactions.add failed (%s): %s", emoji, e)
             return False
 
     async def _remove_reaction(
         self, channel: str, timestamp: str, emoji: str
     ) -> bool:
-        """Remove an emoji reaction from a message. Returns True on success."""
         if not self._app:
             return False
         try:
@@ -608,11 +744,9 @@ class SlackAdapter(BasePlatformAdapter):
             return False
 
     def _reactions_enabled(self) -> bool:
-        """Check if message reactions are enabled via config/env."""
         return os.getenv("SLACK_REACTIONS", "true").lower() not in ("false", "0", "no")
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add an in-progress reaction when message processing begins."""
         if not self._reactions_enabled():
             return
         ts = getattr(event, "message_id", None)
@@ -623,7 +757,6 @@ class SlackAdapter(BasePlatformAdapter):
             await self._add_reaction(channel_id, ts, "eyes")
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Swap the in-progress reaction for a final success/failure reaction."""
         if not self._reactions_enabled():
             return
         ts = getattr(event, "message_id", None)
@@ -642,7 +775,6 @@ class SlackAdapter(BasePlatformAdapter):
     # ----- User identity resolution -----
 
     async def _resolve_user_name(self, user_id: str, chat_id: str = "") -> str:
-        """Resolve a Slack user ID to a display name, with caching."""
         if not user_id:
             return ""
         if user_id in self._user_name_cache:
@@ -655,7 +787,6 @@ class SlackAdapter(BasePlatformAdapter):
             client = self._get_client(chat_id) if chat_id else self._app.client
             result = await client.users_info(user=user_id)
             user = result.get("user", {})
-            # Prefer display_name → real_name → user_id
             profile = user.get("profile", {})
             name = (
                 profile.get("display_name")
@@ -679,7 +810,6 @@ class SlackAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a local image file to Slack by uploading it."""
         try:
             return await self._upload_file(chat_id, image_path, caption, reply_to, metadata)
         except FileNotFoundError:
@@ -705,7 +835,6 @@ class SlackAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send an image to Slack by uploading the URL as a file."""
         if not self._app:
             return SendResult(success=False, error="Not connected")
 
@@ -718,13 +847,11 @@ class SlackAdapter(BasePlatformAdapter):
             import httpx
 
             async def _ssrf_redirect_guard(response):
-                """Re-check redirect targets so public URLs cannot bounce into private IPs."""
                 if response.is_redirect and response.next_request:
                     redirect_url = str(response.next_request.url)
                     if not is_safe_url(redirect_url):
                         raise ValueError("Blocked redirect to private/internal address")
 
-            # Download the image first
             async with httpx.AsyncClient(
                 timeout=30.0,
                 follow_redirects=True,
@@ -750,7 +877,6 @@ class SlackAdapter(BasePlatformAdapter):
                 e,
                 exc_info=True,
             )
-            # Fall back to sending the URL as text
             text = f"{caption}\n{image_url}" if caption else image_url
             return await self.send(chat_id=chat_id, content=text, reply_to=reply_to)
 
@@ -763,7 +889,6 @@ class SlackAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        """Send an audio file to Slack."""
         try:
             return await self._upload_file(chat_id, audio_path, caption, reply_to, metadata)
         except FileNotFoundError:
@@ -785,7 +910,6 @@ class SlackAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a video file to Slack."""
         if not self._app:
             return SendResult(success=False, error="Not connected")
 
@@ -824,7 +948,6 @@ class SlackAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a document/file attachment to Slack."""
         if not self._app:
             return SendResult(success=False, error="Not connected")
 
@@ -857,7 +980,6 @@ class SlackAdapter(BasePlatformAdapter):
             return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-        """Get information about a Slack channel."""
         if not self._app:
             return {"name": chat_id, "type": "unknown"}
 
@@ -881,13 +1003,11 @@ class SlackAdapter(BasePlatformAdapter):
     # ----- Internal handlers -----
 
     def _assistant_thread_key(self, channel_id: str, thread_ts: str) -> Optional[Tuple[str, str]]:
-        """Return a stable cache key for Slack assistant thread metadata."""
         if not channel_id or not thread_ts:
             return None
         return (str(channel_id), str(thread_ts))
 
     def _extract_assistant_thread_metadata(self, event: dict) -> Dict[str, str]:
-        """Extract Slack Assistant thread identity data from an event payload."""
         assistant_thread = event.get("assistant_thread") or {}
         context = assistant_thread.get("context") or event.get("context") or {}
 
@@ -926,7 +1046,6 @@ class SlackAdapter(BasePlatformAdapter):
         }
 
     def _cache_assistant_thread_metadata(self, metadata: Dict[str, str]) -> None:
-        """Remember assistant thread identity data for later message events."""
         channel_id = metadata.get("channel_id", "")
         thread_ts = metadata.get("thread_ts", "")
         key = self._assistant_thread_key(channel_id, thread_ts)
@@ -938,7 +1057,6 @@ class SlackAdapter(BasePlatformAdapter):
         merged.update({k: v for k, v in metadata.items() if v})
         self._assistant_threads[key] = merged
 
-        # Evict oldest entries when the cache exceeds the limit
         if len(self._assistant_threads) > self._ASSISTANT_THREADS_MAX:
             excess = len(self._assistant_threads) - self._ASSISTANT_THREADS_MAX // 2
             for old_key in list(self._assistant_threads)[:excess]:
@@ -954,7 +1072,6 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id: str = "",
         thread_ts: str = "",
     ) -> Dict[str, str]:
-        """Load cached assistant-thread metadata that matches the current event."""
         metadata = self._extract_assistant_thread_metadata(event)
         if channel_id and not metadata.get("channel_id"):
             metadata["channel_id"] = channel_id
@@ -973,7 +1090,6 @@ class SlackAdapter(BasePlatformAdapter):
         return metadata
 
     def _seed_assistant_thread_session(self, metadata: Dict[str, str]) -> None:
-        """Prime the session store so assistant threads get stable user scoping."""
         session_store = getattr(self, "_session_store", None)
         if not session_store:
             return
@@ -1004,22 +1120,16 @@ class SlackAdapter(BasePlatformAdapter):
             )
 
     async def _handle_assistant_thread_lifecycle_event(self, event: dict) -> None:
-        """Handle Slack Assistant lifecycle events that carry user/thread identity."""
         metadata = self._extract_assistant_thread_metadata(event)
         self._cache_assistant_thread_metadata(metadata)
         self._seed_assistant_thread_session(metadata)
 
     async def _handle_slack_message(self, event: dict) -> None:
         """Handle an incoming Slack message event."""
-        # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777)
         event_ts = event.get("ts", "")
         if event_ts and self._dedup.is_duplicate(event_ts):
             return
 
-        # Bot message filtering (SLACK_ALLOW_BOTS / config allow_bots):
-        #   "none"     — ignore all bot messages (default, backward-compatible)
-        #   "mentions" — accept bot messages only when they @mention us
-        #   "all"      — accept all bot messages (except our own)
         if event.get("bot_id") or event.get("subtype") == "bot_message":
             allow_bots = self.config.extra.get("allow_bots", "")
             if not allow_bots:
@@ -1031,13 +1141,10 @@ class SlackAdapter(BasePlatformAdapter):
                 text_check = event.get("text", "")
                 if self._bot_user_id and f"<@{self._bot_user_id}>" not in text_check:
                     return
-            # "all" falls through to process the message
-            # Always ignore our own messages to prevent echo loops
             msg_user = event.get("user", "")
             if msg_user and self._bot_user_id and msg_user == self._bot_user_id:
                 return
 
-        # Ignore message edits and deletions
         subtype = event.get("subtype")
         if subtype in ("message_changed", "message_deleted"):
             return
@@ -1059,37 +1166,21 @@ class SlackAdapter(BasePlatformAdapter):
             or assistant_meta.get("team_id", "")
         )
 
-        # Track which workspace owns this channel
         if team_id and channel_id:
             self._channel_team[channel_id] = team_id
 
-        # Determine if this is a DM or channel message
         channel_type = event.get("channel_type", "")
         if not channel_type and channel_id.startswith("D"):
             channel_type = "im"
-        is_dm = channel_type in ("im", "mpim")  # Both 1:1 and group DMs
+        is_dm = channel_type in ("im", "mpim")
 
-        # Build thread_ts for session keying.
-        # In channels: fall back to ts so each top-level @mention starts a
-        #   new thread/session (the bot always replies in a thread).
-        # In DMs: fall back to ts so each top-level DM reply thread gets
-        #   its own session key (matching channel behavior). Set
-        #   dm_top_level_threads_as_sessions: false in config to revert to
-        #   legacy single-session-per-DM-channel behavior.
         if is_dm:
             thread_ts = event.get("thread_ts") or assistant_meta.get("thread_ts")
             if not thread_ts and self._dm_top_level_threads_as_sessions():
                 thread_ts = ts
         else:
-            thread_ts = event.get("thread_ts") or ts  # ts fallback for channels
+            thread_ts = event.get("thread_ts") or ts
 
-        # In channels, respond if:
-        #   0. Channel is in free_response_channels, OR require_mention is
-        #      disabled — always process regardless of mention.
-        #   1. The bot is @mentioned in this message, OR
-        #   2. The message is a reply in a thread the bot started/participated in, OR
-        #   3. The message is in a thread where the bot was previously @mentioned, OR
-        #   4. There's an existing session for this thread (survives restarts)
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         is_mentioned = bot_uid and f"<@{bot_uid}>" in text
         event_thread_ts = event.get("thread_ts")
@@ -1097,9 +1188,9 @@ class SlackAdapter(BasePlatformAdapter):
 
         if not is_dm and bot_uid:
             if channel_id in self._slack_free_response_channels():
-                pass  # Free-response channel — always process
+                pass
             elif not self._slack_require_mention():
-                pass  # Mention requirement disabled globally for Slack
+                pass
             elif not is_mentioned:
                 reply_to_bot_thread = (
                     is_thread_reply and event_thread_ts in self._bot_message_ts
@@ -1120,9 +1211,7 @@ class SlackAdapter(BasePlatformAdapter):
                     return
 
         if is_mentioned:
-            # Strip the bot mention from the text
             text = text.replace(f"<@{bot_uid}>", "").strip()
-            # Register this thread so all future messages auto-trigger the bot
             if event_thread_ts:
                 self._mentioned_threads.add(event_thread_ts)
                 if len(self._mentioned_threads) > self._MENTIONED_THREADS_MAX:
@@ -1130,8 +1219,6 @@ class SlackAdapter(BasePlatformAdapter):
                     for t in to_remove:
                         self._mentioned_threads.discard(t)
 
-        # When entering a thread for the first time (no existing session),
-        # fetch thread context so the agent understands the conversation.
         if is_thread_reply and not self._has_active_session_for_thread(
             channel_id=channel_id,
             thread_ts=event_thread_ts,
@@ -1146,12 +1233,10 @@ class SlackAdapter(BasePlatformAdapter):
             if thread_context:
                 text = thread_context + text
 
-        # Determine message type
         msg_type = MessageType.TEXT
         if text.startswith("/"):
             msg_type = MessageType.COMMAND
 
-        # Handle file attachments
         media_urls = []
         media_types = []
         files = event.get("files", [])
@@ -1163,7 +1248,6 @@ class SlackAdapter(BasePlatformAdapter):
                     ext = "." + mimetype.split("/")[-1].split(";")[0]
                     if ext not in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
                         ext = ".jpg"
-                    # Slack private URLs require the bot token as auth header
                     cached = await self._download_slack_file(url, ext, team_id=team_id)
                     media_urls.append(cached)
                     media_types.append(mimetype)
@@ -1182,7 +1266,6 @@ class SlackAdapter(BasePlatformAdapter):
                 except Exception as e:  # pragma: no cover - defensive logging
                     logger.warning("[Slack] Failed to cache audio from %s: %s", url, e, exc_info=True)
             elif url:
-                # Try to handle as a document attachment
                 try:
                     original_filename = f.get("name", "")
                     ext = ""
@@ -1190,22 +1273,19 @@ class SlackAdapter(BasePlatformAdapter):
                         _, ext = os.path.splitext(original_filename)
                         ext = ext.lower()
 
-                    # Fallback: reverse-lookup from MIME type
                     if not ext and mimetype:
                         mime_to_ext = {v: k for k, v in SUPPORTED_DOCUMENT_TYPES.items()}
                         ext = mime_to_ext.get(mimetype, "")
 
                     if ext not in SUPPORTED_DOCUMENT_TYPES:
-                        continue  # Skip unsupported file types silently
+                        continue
 
-                    # Check file size (Slack limit: 20 MB for bots)
                     file_size = f.get("size", 0)
                     MAX_DOC_BYTES = 20 * 1024 * 1024
                     if not file_size or file_size > MAX_DOC_BYTES:
                         logger.warning("[Slack] Document too large or unknown size: %s", file_size)
                         continue
 
-                    # Download and cache
                     raw_bytes = await self._download_slack_file_bytes(url, team_id=team_id)
                     cached_path = cache_document_from_bytes(
                         raw_bytes, original_filename or f"document{ext}"
@@ -1216,7 +1296,6 @@ class SlackAdapter(BasePlatformAdapter):
                     msg_type = MessageType.DOCUMENT
                     logger.debug("[Slack] Cached user document: %s", cached_path)
 
-                    # Inject text content for .txt/.md files (capped at 100 KB)
                     MAX_TEXT_INJECT_BYTES = 100 * 1024
                     if ext in (".md", ".txt") and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
                         try:
@@ -1229,25 +1308,22 @@ class SlackAdapter(BasePlatformAdapter):
                             else:
                                 text = injection
                         except UnicodeDecodeError:
-                            pass  # Binary content, skip injection
+                            pass
 
                 except Exception as e:  # pragma: no cover - defensive logging
                     logger.warning("[Slack] Failed to cache document from %s: %s", url, e, exc_info=True)
 
-        # Resolve user display name (cached after first lookup)
         user_name = await self._resolve_user_name(user_id, chat_id=channel_id)
 
-        # Build source
         source = self.build_source(
             chat_id=channel_id,
-            chat_name=channel_id,  # Will be resolved later if needed
+            chat_name=channel_id,
             chat_type="dm" if is_dm else "group",
             user_id=user_id,
             user_name=user_name,
             thread_id=thread_ts,
         )
 
-        # Per-channel ephemeral prompt
         from gateway.platforms.base import resolve_channel_prompt
         _channel_prompt = resolve_channel_prompt(
             self.config.extra, channel_id, None,
@@ -1265,9 +1341,6 @@ class SlackAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
         )
 
-        # Only react when bot is directly addressed (DM or @mention).
-        # In listen-all channels (require_mention=false), reacting to every
-        # casual message would be noisy.
         _should_react = (is_dm or is_mentioned) and self._reactions_enabled()
         if _should_react:
             self._reacting_message_ids.add(ts)
@@ -1281,11 +1354,7 @@ class SlackAdapter(BasePlatformAdapter):
         description: str = "dangerous command",
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a Block Kit approval prompt with interactive buttons.
-
-        The buttons call ``resolve_gateway_approval()`` to unblock the waiting
-        agent thread — same mechanism as the text ``/approve`` flow.
-        """
+        """Send a Block Kit approval prompt with interactive buttons."""
         if not self._app:
             return SendResult(success=False, error="Not connected")
 
@@ -1368,9 +1437,6 @@ class SlackAdapter(BasePlatformAdapter):
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
 
-        # Only authorized users may click approval buttons.  Button clicks
-        # bypass the normal message auth flow in gateway/run.py, so we must
-        # check here as well.
         allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
         if allowed_csv:
             allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
@@ -1381,7 +1447,6 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 return
 
-        # Map action_id to approval choice
         choice_map = {
             "hermes_approve_once": "once",
             "hermes_approve_session": "session",
@@ -1390,11 +1455,9 @@ class SlackAdapter(BasePlatformAdapter):
         }
         choice = choice_map.get(action_id, "deny")
 
-        # Prevent double-clicks — atomic pop; first caller gets False, others get True (default)
         if self._approval_resolved.pop(msg_ts, True):
             return
 
-        # Update the message to show the decision and remove buttons
         label_map = {
             "once": f"✅ Approved once by {user_name}",
             "session": f"✅ Approved for session by {user_name}",
@@ -1403,7 +1466,6 @@ class SlackAdapter(BasePlatformAdapter):
         }
         decision_text = label_map.get(choice, f"Resolved by {user_name}")
 
-        # Get original text from the section block
         original_text = ""
         for block in message.get("blocks", []):
             if block.get("type") == "section":
@@ -1436,7 +1498,6 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[Slack] Failed to update approval message: %s", e)
 
-        # Resolve the approval — this unblocks the agent thread
         try:
             from tools.approval import resolve_gateway_approval
             count = resolve_gateway_approval(session_key, choice)
@@ -1447,8 +1508,6 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("Failed to resolve gateway approval from Slack button: %s", exc)
 
-        # (approval state already consumed by atomic pop above)
-
     # ----- Thread context fetching -----
 
     async def _fetch_thread_context(
@@ -1456,20 +1515,7 @@ class SlackAdapter(BasePlatformAdapter):
         team_id: str = "", limit: int = 30,
     ) -> str:
         """Fetch recent thread messages to provide context when the bot is
-        mentioned mid-thread for the first time.
-
-        This method is only called when there is NO active session for the
-        thread (guarded at the call site by _has_active_session_for_thread).
-        That guard ensures thread messages are prepended only on the very
-        first turn — after that the session history already holds them, so
-        there is no duplication across subsequent turns.
-
-        Results are cached for _THREAD_CACHE_TTL seconds per thread to avoid
-        hammering conversations.replies (Tier 3, ~50 req/min).
-
-        Returns a formatted string with prior thread history, or empty string
-        on failure or if the thread has no prior messages.
-        """
+        mentioned mid-thread for the first time."""
         cache_key = f"{channel_id}:{thread_ts}"
         now = time.monotonic()
         cached = self._thread_context_cache.get(cache_key)
@@ -1479,19 +1525,17 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             client = self._get_client(channel_id)
 
-            # Retry with exponential backoff for Tier-3 rate limits (429).
             result = None
             for attempt in range(3):
                 try:
                     result = await client.conversations_replies(
                         channel=channel_id,
                         ts=thread_ts,
-                        limit=limit + 1,  # +1 because it includes the current message
+                        limit=limit + 1,
                         inclusive=True,
                     )
                     break
                 except Exception as exc:
-                    # Check for rate-limit error from slack_sdk
                     err_str = str(exc).lower()
                     is_rate_limit = (
                         "ratelimited" in err_str
@@ -1499,7 +1543,7 @@ class SlackAdapter(BasePlatformAdapter):
                         or "rate_limited" in err_str
                     )
                     if is_rate_limit and attempt < 2:
-                        retry_after = 1.0 * (2 ** attempt)  # 1s, 2s
+                        retry_after = 1.0 * (2 ** attempt)
                         logger.warning(
                             "[Slack] conversations.replies rate limited; retrying in %.1fs (attempt %d/3)",
                             retry_after, attempt + 1,
@@ -1519,11 +1563,8 @@ class SlackAdapter(BasePlatformAdapter):
             context_parts = []
             for msg in messages:
                 msg_ts = msg.get("ts", "")
-                # Exclude the current triggering message — it will be delivered
-                # as the user message itself, so including it here would duplicate it.
                 if msg_ts == current_ts:
                     continue
-                # Exclude our own bot messages to avoid circular context.
                 if msg.get("bot_id") or msg.get("subtype") == "bot_message":
                     continue
 
@@ -1531,7 +1572,6 @@ class SlackAdapter(BasePlatformAdapter):
                 if not msg_text:
                     continue
 
-                # Strip bot mentions from context messages
                 if bot_uid:
                     msg_text = msg_text.replace(f"<@{bot_uid}>", "").strip()
 
@@ -1567,28 +1607,24 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id = command.get("channel_id", "")
         team_id = command.get("team_id", "")
 
-        # Track which workspace owns this channel
         if team_id and channel_id:
             self._channel_team[channel_id] = team_id
 
-        # Map subcommands to gateway commands — derived from central registry.
-        # Also keep "compact" as a Slack-specific alias for /compress.
         from hermes_cli.commands import slack_subcommand_map
         subcommand_map = slack_subcommand_map()
         subcommand_map["compact"] = "/compress"
         first_word = text.split()[0] if text else ""
         if first_word in subcommand_map:
-            # Preserve arguments after the subcommand
             rest = text[len(first_word):].strip()
             text = f"{subcommand_map[first_word]} {rest}".strip() if rest else subcommand_map[first_word]
         elif text:
-            pass  # Treat as a regular question
+            pass
         else:
             text = "/help"
 
         source = self.build_source(
             chat_id=channel_id,
-            chat_type="dm",  # Slash commands are always in DM-like context
+            chat_type="dm",
             user_id=user_id,
         )
 
@@ -1607,16 +1643,7 @@ class SlackAdapter(BasePlatformAdapter):
         thread_ts: str,
         user_id: str,
     ) -> bool:
-        """Check if there's an active session for a thread.
-
-        Used to determine if thread replies without @mentions should be
-        processed (they should if there's an active session).
-
-        Uses ``build_session_key()`` as the single source of truth for key
-        construction — avoids the bug where manual key building didn't
-        respect ``thread_sessions_per_user`` and ``group_sessions_per_user``
-        settings correctly.
-        """
+        """Check if there's an active session for a thread."""
         session_store = getattr(self, "_session_store", None)
         if not session_store:
             return False
@@ -1632,7 +1659,6 @@ class SlackAdapter(BasePlatformAdapter):
                 thread_id=thread_ts,
             )
 
-            # Read session isolation settings from the store's config
             store_cfg = getattr(session_store, "config", None)
             gspu = getattr(store_cfg, "group_sessions_per_user", True) if store_cfg else True
             tspu = getattr(store_cfg, "thread_sessions_per_user", False) if store_cfg else False
@@ -1663,10 +1689,6 @@ class SlackAdapter(BasePlatformAdapter):
                     )
                     response.raise_for_status()
 
-                    # Slack may return an HTML sign-in/redirect page
-                    # instead of actual media bytes (e.g. expired token,
-                    # restricted file access).  Detect this early so we
-                    # don't cache bogus data and confuse downstream tools.
                     ct = response.headers.get("content-type", "")
                     if "text/html" in ct:
                         raise ValueError(
@@ -1719,12 +1741,7 @@ class SlackAdapter(BasePlatformAdapter):
     # ── Channel mention gating ─────────────────────────────────────────────
 
     def _slack_require_mention(self) -> bool:
-        """Return whether channel messages require an explicit bot mention.
-
-        Uses explicit-false parsing (like Discord/Matrix) rather than
-        truthy parsing, since the safe default is True (gating on).
-        Unrecognised or empty values keep gating enabled.
-        """
+        """Return whether channel messages require an explicit bot mention."""
         configured = self.config.extra.get("require_mention")
         if configured is not None:
             if isinstance(configured, str):
