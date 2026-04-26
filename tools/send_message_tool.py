@@ -330,6 +330,11 @@ def _parse_target_ref(platform_name: str, target_ref: str):
             return target_ref.strip(), None, True
     if target_ref.lstrip("-").isdigit():
         return target_ref, None, True
+    # Slack channel/DM/group/user IDs are alphanumeric (e.g. C0AULQVA7SA, D0AV1RESZ1P).
+    # C = public channel, D = DM, G = private group/MPDM, U/W = user.
+    # Without this, isdigit() rejects them and they fall through to home-channel.
+    if platform_name == "slack" and re.fullmatch(r"[CDGUW][A-Z0-9]{8,}", target_ref):
+        return target_ref, None, True
     # Matrix room IDs (start with !) and user IDs (start with @) are explicit
     if platform_name == "matrix" and (target_ref.startswith("!") or target_ref.startswith("@")):
         return target_ref, None, True
