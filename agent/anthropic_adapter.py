@@ -1696,15 +1696,20 @@ def convert_messages_to_anthropic(
             # blocks (neither upstream can validate Anthropic signatures) but
             # preserve the unsigned ones we synthesised from reasoning_content.
             new_content = []
+            # DeepSeek populates `signature` with the message id as a placeholder
+            # and requires the block round-trip on replay, so we keep signed
+            # blocks for DeepSeek. Kimi cannot validate Anthropic signatures
+            # so we still strip them there.
+            _ds_keep_signed = _is_deepseek_anthropic_endpoint(base_url)
             for b in m["content"]:
                 if not isinstance(b, dict) or b.get("type") not in _THINKING_TYPES:
                     new_content.append(b)
                     continue
-                if b.get("signature") or b.get("data"):
-                    # Anthropic-signed block — upstream can't validate, strip
+                if (b.get("signature") or b.get("data")) and not _ds_keep_signed:
+                    # Anthropic-signed block on Kimi — upstream cannot validate, strip
                     continue
-                # Unsigned thinking (synthesised from reasoning_content) —
-                # keep it: the upstream needs it for message-history validation.
+                # Unsigned thinking (synthesised from reasoning_content) — keep.
+                # On DeepSeek, also keep signed blocks (placeholder signatures).
                 new_content.append(b)
             m["content"] = new_content or [{"type": "text", "text": "(empty)"}]
         elif _is_third_party or idx != last_assistant_idx:
