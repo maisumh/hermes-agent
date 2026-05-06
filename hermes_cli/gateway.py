@@ -1767,7 +1767,7 @@ Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
 Restart=always
-RestartSec=60
+RestartSec=1
 RestartMaxDelaySec=300
 RestartSteps=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
@@ -1795,6 +1795,7 @@ Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
+EnvironmentFile=%h/.hermes/.env
 Type=simple
 ExecStart={python_path} -m hermes_cli.main{f" {profile_arg}" if profile_arg else ""} gateway run --replace
 WorkingDirectory={working_dir}
@@ -1802,7 +1803,7 @@ Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
 Restart=always
-RestartSec=60
+RestartSec=1
 RestartMaxDelaySec=300
 RestartSteps=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
