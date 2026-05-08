@@ -203,12 +203,28 @@ def _derive_responses_function_call_id(
 # ---------------------------------------------------------------------------
 
 def _responses_tools(tools: Optional[List[Dict[str, Any]]] = None) -> Optional[List[Dict[str, Any]]]:
-    """Convert chat-completions tool schemas to Responses function-tool schemas."""
+    """Convert chat-completions tool schemas to Responses function-tool schemas.
+
+    Also runs ``sanitize_tool_schemas`` over the input before conversion so
+    that Codex's strict tool-schema validator on ``chatgpt.com/backend-api/codex``
+    doesn't reject the request with HTTP 400 over shapes that DeepSeek and
+    Anthropic silently accept (e.g. ``type: "array"`` without ``items``,
+    ``type: ["X", "null"]`` nullable unions, bare-string schema values).
+    Anthropic, Gemini, and Moonshot transports already sanitize before send;
+    this brings codex_responses to parity.
+    """
     if not tools:
         return None
 
+    # Sanitize first — handles array-missing-items, nullable unions, and the
+    # other classes of MCP-shaped schemas that Codex's strict validator rejects.
+    # Local import to avoid a top-level dependency on the tools/ package from
+    # an agent/ module (matches the lazy-import pattern used elsewhere).
+    from tools.schema_sanitizer import sanitize_tool_schemas
+    sanitized_tools = sanitize_tool_schemas(tools)
+
     converted: List[Dict[str, Any]] = []
-    for item in tools:
+    for item in sanitized_tools:
         fn = item.get("function", {}) if isinstance(item, dict) else {}
         name = fn.get("name")
         if not isinstance(name, str) or not name.strip():

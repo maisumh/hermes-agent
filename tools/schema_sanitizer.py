@@ -243,6 +243,26 @@ def _sanitize_node(node: Any, path: str) -> Any:
     if out.get("type") == "object" and not isinstance(out.get("properties"), dict):
         out["properties"] = {}
 
+    # Array nodes without ``items``: inject a permissive items schema.
+    # OpenAI's strict-mode tool validator on the Codex Responses backend
+    # (chatgpt.com/backend-api/codex) rejects ``type: "array"`` without
+    # ``items`` with HTTP 400 ``invalid_function_parameters`` even though
+    # ``items`` is technically optional in JSON Schema. Many MCP servers
+    # ship arrays without items definitions — a single one breaks every
+    # tool-using call once it reaches the wire (the validator runs over
+    # the whole tool list before any model call).  Inject ``{}`` (the
+    # canonical "any value" schema) so the wire payload validates while
+    # preserving the original semantics — the model still sees an array
+    # that accepts heterogeneous items.  Anthropic and Gemini accept the
+    # same shape, so this is safe across all transports that consume
+    # sanitized tool schemas.
+    if out.get("type") == "array" and "items" not in out:
+        out["items"] = {}
+        logger.debug(
+            "schema_sanitizer[%s]: injecting default items: {} on "
+            "array node missing items (Codex strict-mode compat)", path,
+        )
+
     # Prune ``required`` entries that don't exist in properties (defense
     # against malformed MCP schemas; also caught upstream for MCP tools, but
     # built-in tools or plugin tools may not have been through that path).
