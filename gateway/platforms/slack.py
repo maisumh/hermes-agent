@@ -741,6 +741,19 @@ class SlackAdapter(BasePlatformAdapter):
             if self._has_rich_structure(content):
                 blocks, attachments, fallback = self._markdown_to_blocks(content)
 
+                # Slack rejects > 50 blocks per message with `invalid_blocks`.
+                # When long responses with many headings/bullets overflow the
+                # cap, skip Block Kit and use the plain mrkdwn path below,
+                # which splits by MAX_MESSAGE_LENGTH and has no per-message
+                # block-item cap.
+                if blocks and len(blocks) > 50:
+                    logger.warning(
+                        "[Slack] markdown produced %d blocks (>50 cap) — falling through to plain mrkdwn",
+                        len(blocks),
+                    )
+                    blocks = []
+                    attachments = []
+
                 if blocks or attachments:
                     kwargs: Dict[str, Any] = {
                         "channel": chat_id,
