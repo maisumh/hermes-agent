@@ -846,13 +846,6 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
     saw_commentary_phase = False
     saw_final_answer_phase = False
 
-    if not isinstance(output, list):
-        logger.warning(
-            "codex_responses: resp.output is %s (not a list) - treating as "
-            "empty; resp_type=%s is_dict=%s repr=%.400r",
-            type(output).__name__, type(resp).__name__, isinstance(resp, dict), resp,
-        )
-        output = []
     for item in output:
         item_type = getattr(item, "type", None)
         item_status = getattr(item, "status", None)
