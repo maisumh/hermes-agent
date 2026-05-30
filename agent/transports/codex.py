@@ -9,6 +9,10 @@ from typing import Any, Dict, List, Optional
 
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
+# Apply the Codex null-output SDK guard at import time (gateway startup).
+# Upstream openai SDK crashes on response.output=None from the ChatGPT Codex
+# backend (hermes-agent#33578); this module monkeypatches parse_response.
+from agent import codex_sdk_nullguard as _codex_sdk_nullguard  # noqa: F401
 
 
 class ResponsesApiTransport(ProviderTransport):
