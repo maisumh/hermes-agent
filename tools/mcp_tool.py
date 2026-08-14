@@ -262,6 +262,12 @@ _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
 _MAX_RECONNECT_RETRIES = 5
 _MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
 _MAX_BACKOFF_SECONDS = 60
+# After a server that was previously healthy exhausts its fast reconnect
+# attempts, keep the supervisor alive and begin a fresh bounded cycle after a
+# quiet period.  Without this reset, a long-lived gateway permanently loses
+# the MCP task until a full reload/restart even when credentials or remote
+# health later recover.
+_RECONNECT_RESET_DELAY_SECONDS = 300
 
 # Environment variables that are safe to pass to stdio subprocesses
 _SAFE_ENV_KEYS = frozenset({
@@ -1766,10 +1772,16 @@ class MCPServerTask:
                 if retries > _MAX_RECONNECT_RETRIES:
                     logger.warning(
                         "MCP server '%s' failed after %d reconnection attempts, "
-                        "giving up: %s",
-                        self.name, _MAX_RECONNECT_RETRIES, exc,
+                        "pausing %.0fs before a fresh reconnect cycle: %s",
+                        self.name, _MAX_RECONNECT_RETRIES,
+                        _RECONNECT_RESET_DELAY_SECONDS, exc,
                     )
-                    return
+                    await asyncio.sleep(_RECONNECT_RESET_DELAY_SECONDS)
+                    if self._shutdown_event.is_set():
+                        return
+                    retries = 0
+                    backoff = 1.0
+                    continue
 
                 logger.warning(
                     "MCP server '%s' connection lost (attempt %d/%d), "

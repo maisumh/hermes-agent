@@ -1650,6 +1650,42 @@ class TestReconnection:
 
         asyncio.run(_test())
 
+    def test_reconnect_cycle_resets_and_recovers_after_exhaustion(self):
+        """A previously healthy server can recover after one failed cycle."""
+        from tools.mcp_tool import (
+            MCPServerTask,
+            _MAX_RECONNECT_RETRIES,
+            _RECONNECT_RESET_DELAY_SECONDS,
+        )
+
+        run_count = 0
+
+        async def fake_run_stdio(server, _config):
+            nonlocal run_count
+            run_count += 1
+            if run_count == 1:
+                server._ready.set()
+                raise ConnectionError("keepalive lost")
+            if run_count <= _MAX_RECONNECT_RETRIES + 1:
+                raise ConnectionError("remote still unavailable")
+            server._shutdown_event.set()
+
+        async def _test():
+            server = MCPServerTask("recovering-server")
+            sleeps = []
+
+            async def fake_sleep(delay):
+                sleeps.append(delay)
+
+            with patch.object(MCPServerTask, "_run_stdio", fake_run_stdio), \
+                 patch("asyncio.sleep", side_effect=fake_sleep):
+                await server.run({"command": "test"})
+
+            assert run_count == _MAX_RECONNECT_RETRIES + 2
+            assert _RECONNECT_RESET_DELAY_SECONDS in sleeps
+
+        asyncio.run(_test())
+
     def test_no_reconnect_on_initial_failure(self):
         """First connection failure retries up to _MAX_INITIAL_CONNECT_RETRIES times.
 
